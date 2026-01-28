@@ -1,12 +1,14 @@
 package com.example.lennycat.wallpaper
 
+import android.content.Context
 import android.os.Handler
 import android.os.HandlerThread
+import android.view.Choreographer
 import android.view.Surface
 import android.view.SurfaceHolder
-import android.view.Choreographer
 
-class EglRenderThread(name: String) : HandlerThread(name), Choreographer.FrameCallback {
+class EglRenderThread(name: String, context: Context) : HandlerThread(name), Choreographer.FrameCallback {
+    private val appContext = context.applicationContext
     private val readyLock = Object()
     private var handler: Handler? = null
     private var choreographer: Choreographer? = null
@@ -20,6 +22,9 @@ class EglRenderThread(name: String) : HandlerThread(name), Choreographer.FrameCa
     private var visible = false
     private var frameScheduled = false
     private var lastFrameNanos = 0L
+
+    private val pendingTouches = ArrayList<PaintRenderer.TouchEvent>()
+    private val touchLock = Any()
 
     override fun onLooperPrepared() {
         handler = Handler(looper)
@@ -48,7 +53,7 @@ class EglRenderThread(name: String) : HandlerThread(name), Choreographer.FrameCa
             initEglIfNeeded()
             createSurface(holder.surface)
             if (renderer == null) {
-                renderer = PaintRenderer()
+                renderer = PaintRenderer(appContext)
                 renderer?.onSurfaceCreated()
             }
             if (surfaceWidth > 0 && surfaceHeight > 0) {
@@ -108,11 +113,18 @@ class EglRenderThread(name: String) : HandlerThread(name), Choreographer.FrameCa
         quitSafely()
     }
 
+    fun queueTouch(x: Float, y: Float, dx: Float, dy: Float) {
+        synchronized(touchLock) {
+            pendingTouches.add(PaintRenderer.TouchEvent(x, y, dx, dy))
+        }
+    }
+
     override fun doFrame(frameTimeNanos: Long) {
         frameScheduled = false
         if (!visible || eglSurface == null || renderer == null) {
             return
         }
+        val touches = drainTouches()
         if (lastFrameNanos == 0L) {
             lastFrameNanos = frameTimeNanos
         }
@@ -120,6 +132,9 @@ class EglRenderThread(name: String) : HandlerThread(name), Choreographer.FrameCa
         lastFrameNanos = frameTimeNanos
 
         eglCore?.makeCurrent(eglSurface!!)
+        if (touches.isNotEmpty()) {
+            touches.forEach { renderer?.enqueueTouch(it.x, it.y, it.dx, it.dy) }
+        }
         renderer?.onDrawFrame(dt)
         eglCore?.swapBuffers(eglSurface!!)
 
@@ -144,5 +159,14 @@ class EglRenderThread(name: String) : HandlerThread(name), Choreographer.FrameCa
         eglSurface = eglCore?.createWindowSurface(surface)
         eglCore?.makeCurrent(eglSurface!!)
         eglCore?.setSwapInterval(1)
+    }
+
+    private fun drainTouches(): List<PaintRenderer.TouchEvent> {
+        synchronized(touchLock) {
+            if (pendingTouches.isEmpty()) return emptyList()
+            val copy = ArrayList<PaintRenderer.TouchEvent>(pendingTouches)
+            pendingTouches.clear()
+            return copy
+        }
     }
 }
